@@ -687,6 +687,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
+    n_embd_ = g.n_embd;
 
     const strata::kernels::QsaShapes s = shapes_of(g);
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
@@ -3910,6 +3911,15 @@ bool Verifier::copy_logits(int t, float* host) const {
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
+bool Verifier::copy_hidden(int t, float* host) const {
+#if defined(STRATA_GPU_METAL)
+    return false;
+#endif
+    if (next_ != nullptr) return next_->copy_hidden(t, host);   // a layer split: the head is on the last stage
+    if (head_mixed_ == nullptr || host == nullptr || t < 0 || n_embd_ <= 0) return false;
+    return cudaMemcpy(host, head_mixed_ + (size_t) t * (size_t) n_embd_, (size_t) n_embd_ * sizeof(float),
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
+}
 
 // ================================ PIPELINED WINDOWS (see verify.hpp) ================================
 //

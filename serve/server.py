@@ -1218,6 +1218,9 @@ class StrataEngine:
         k = top_logprobs(sampling)
         if k is not None:                       # an LP line after each T line (an engine without them ignores the key)
             keys += f" logprobs={k}"
+        hp = sampling.get("strata_hidden_path")
+        if isinstance(hp, str) and os.path.dirname(hp) == HIDDEN_DIR:   # only a path hidden_request made
+            keys += f" hidden={hp}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -5014,6 +5017,35 @@ def logprob_span(text: str, part: str, entries: list):
     return entries[first:] if first is not None and at == start + len(part) else None
 
 
+HIDDEN_DIR = tempfile.mkdtemp(prefix="strata-hidden-")
+
+
+def hidden_request(req: dict):
+    """`"strata_hidden": true`: the reply carries the first token's head input (the vector the head multiplies,
+    n_embd float32) as choices[0].strata_hidden, for a decision probe trained on it. One token, not streamed: else a
+    400. The engine writes it to a file this server names; a path in the request itself is dropped."""
+    req.pop("strata_hidden_path", None)
+    if not req.get("strata_hidden"):
+        return None
+    if int(req.get("max_completion_tokens") or req.get("max_tokens") or 0) != 1 or req.get("stream"):
+        raise ValueError("strata_hidden: only with max_tokens 1 and stream false")
+    req["strata_hidden_path"] = os.path.join(HIDDEN_DIR, uuid.uuid4().hex + ".f32")
+    return req["strata_hidden_path"]
+
+
+def take_hidden(path: str):
+    """The engine's file as the response field, removed once read; None when the engine wrote none."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        os.unlink(path)
+    except OSError:
+        return None
+    if not raw or len(raw) % 4:
+        return None
+    return {"dtype": "float32", "dim": len(raw) // 4, "b64": base64.b64encode(raw).decode()}
+
+
 def continued_message(req: dict, messages: list, kwargs: dict):
     """vLLM's `continue_final_message`: the reply continues the last message, an assistant turn left open, instead of
     starting a new one (a typed decision primes its answer with `{"answer": "`).  That message leaves `messages`; its
@@ -6138,6 +6170,7 @@ def make_handler(svc: Service):
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             prefill = continued_message(req, messages, kw)            # a 400 before anything is sent
+            hidden = hidden_request(req)                              # ... and so is strata_hidden past one token
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
@@ -6179,7 +6212,14 @@ def make_handler(svc: Service):
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                out = openai_collect(chunks)
+                if hidden is not None:
+                    got = take_hidden(hidden)
+                    if got is None:                          # an engine without the key, or a failed write
+                        return self._json(500, {"error": {"type": "server_error",
+                                                          "message": "strata_hidden: the engine wrote no hidden state"}})
+                    out["choices"][0]["strata_hidden"] = got
+                return self._json(200, out)
             self._sse()
             try:
                 for c in chunks:

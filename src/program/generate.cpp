@@ -11640,7 +11640,19 @@ int main(int argc, char** argv) {
             // penalties and temperature), as the SYCL port does. -1 (absent): no LP lines; a server that does not ask
             // never sees one.
             int req_logprobs = -1;
-            auto emit_lp = [&req_logprobs](const strata::core::Verifier& v, int row, int32_t tok) {
+            // hidden=<path>: the first token's head input (n_embd float32, Verifier::copy_hidden) written to <path>,
+            // for a decision probe. Written once, as the first token is emitted; a failed write is only logged, and the
+            // server, which finds no file, fails the request.
+            std::string req_hidden;
+            auto emit_lp = [&req_logprobs, &req_hidden](const strata::core::Verifier& v, int row, int32_t tok) {
+                if (!req_hidden.empty()) {
+                    std::vector<float> h((size_t) std::max<int64_t>(v.embd(), 0));
+                    std::FILE* f = !h.empty() && v.copy_hidden(row, h.data()) ? std::fopen(req_hidden.c_str(), "wb") : nullptr;
+                    const bool ok = f != nullptr && std::fwrite(h.data(), sizeof(float), h.size(), f) == h.size();
+                    if (f) std::fclose(f);
+                    if (!ok) std::fprintf(stderr, "strata serve: hidden: cannot write %s\n", req_hidden.c_str());
+                    req_hidden.clear();
+                }
                 if (req_logprobs < 0) return;
                 static std::vector<float> lrow;
                 static std::vector<int32_t> lord;
@@ -11711,6 +11723,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "logprobs") req_logprobs = std::clamp(std::atoi(tok.c_str() + eq + 1), -1, 20);
+                    else if (key == "hidden") req_hidden = tok.substr(eq + 1);
                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);

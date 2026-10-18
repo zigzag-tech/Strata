@@ -106,6 +106,10 @@ public:
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
+    /// Row `t` of the last window's head input (n_embd floats: the final mixer's output, what the head multiplies)
+    /// to the host. Valid after run(). A probe trained on it is a decision head that needs no adapter.
+    bool copy_hidden(int t, float* host) const;
+    int64_t embd() const { return next_ ? next_->embd() : n_embd_; }
     /// #879 GUARD: the first row of the last finished window (run, run_slot_rows, batch_poll, pl_finish) whose head
     /// logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every window graph
     /// checks its T rows on the device beside the greedy pick (logits_nonfinite_rows into mapped flags, read after
@@ -519,6 +523,7 @@ private:
     int64_t last_pos0_ = 0;
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
+    int64_t n_embd_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
