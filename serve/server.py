@@ -4022,7 +4022,7 @@ class Service:
             self.prompts.forget(ids)
 
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None, prefill=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
@@ -4032,6 +4032,8 @@ class Service:
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
+        if prefill:                                   # continue_final_message: the open assistant turn's text
+            ids = ids + self.tok.encode(prefill)
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
@@ -5010,6 +5012,22 @@ def logprob_span(text: str, part: str, entries: list):
             return entries[first:i]
         at += len(e["token"])
     return entries[first:] if first is not None and at == start + len(part) else None
+
+
+def continued_message(req: dict, messages: list, kwargs: dict):
+    """vLLM's `continue_final_message`: the reply continues the last message, an assistant turn left open, instead of
+    starting a new one (a typed decision primes its answer with `{"answer": "`).  That message leaves `messages`; its
+    text is returned for prepare() to put after the generation prompt.  Thinking off only: with thinking on the
+    generation prompt opens a reasoning block and the text would land inside it."""
+    if not req.get("continue_final_message"):
+        return None
+    last = messages[-1] if messages else None
+    if not last or last.get("role") != "assistant" or not isinstance(last.get("content"), str) or last.get("tool_calls"):
+        raise ValueError("continue_final_message: the last message must be an assistant message with text content")
+    if kwargs.get("enable_thinking", True) is not False:
+        raise ValueError("continue_final_message: only with thinking off (chat_template_kwargs.enable_thinking false)")
+    messages.pop()
+    return last["content"]
 
 
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
@@ -6119,6 +6137,7 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
+            prefill = continued_message(req, messages, kw)            # a 400 before anything is sent
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
@@ -6150,7 +6169,8 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel,
+                                                 prefill=prefill)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
