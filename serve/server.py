@@ -819,6 +819,7 @@ class StrataEngine:
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        self.can_confirm_gpu_idle = False
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
@@ -886,6 +887,7 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_confirm_gpu_idle = "gpu_barrier" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
@@ -2084,36 +2086,49 @@ class StrataEngine:
                     done = True
                     raise ValueError(line[4:].strip())
         finally:
-            if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
-                if self.can_stop:
+            if not done:
+                protected = getattr(getattr(self, '_harmony_extraction_context', None), 'active', False)
+                if protected:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
-                    except OSError:
-                        pass
-                # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
-                # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
-                # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
-                heard = time.monotonic()
-                while True:
-                    left = allow - (time.monotonic() - heard) if allow > 0 else None
+                        from serve.bounded_stop import stop_and_drain, StopUnconfirmed
+                    except ModuleNotFoundError:
+                        from bounded_stop import stop_and_drain, StopUnconfirmed
                     try:
-                        if carry is not NO_LINE:          # read already, after the last token
-                            line, carry = carry, NO_LINE
-                        elif left is not None and left <= 0:
-                            raise queue.Empty
-                        else:
-                            line = self.lines.get(timeout=left)
-                    except queue.Empty:
-                        raise self._silent("the engine did not finish the request after it was stopped (STOP) "
-                                           f"within {allow:.0f} s") from None
-                    if line is None or line.startswith("ERR"):
-                        break
-                    if line.startswith("DONE"):
-                        self._parse_done(line)
-                        break
-                    if not self.can_stop:
-                        heard = time.monotonic()
+                        line = stop_and_drain(self.proc, self.lines, can_stop=self.can_stop,
+                            initial_lines=(carry,) if carry is not NO_LINE else ())
+                    except StopUnconfirmed as exc:
+                        raise EngineDied(str(exc)) from exc
+                    self._parse_done(line)
+                else:
+                    if self.can_stop:
+                        try:
+                            self.proc.stdin.write("STOP\n")
+                            self.proc.stdin.flush()
+                        except OSError:
+                            pass
+                    # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
+                    # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
+                    # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
+                    heard = time.monotonic()
+                    while True:
+                        left = allow - (time.monotonic() - heard) if allow > 0 else None
+                        try:
+                            if carry is not NO_LINE:          # read already, after the last token
+                                line, carry = carry, NO_LINE
+                            elif left is not None and left <= 0:
+                                raise queue.Empty
+                            else:
+                                line = self.lines.get(timeout=left)
+                        except queue.Empty:
+                            raise self._silent("the engine did not finish the request after it was stopped (STOP) "
+                                               f"within {allow:.0f} s") from None
+                        if line is None or line.startswith("ERR"):
+                            break
+                        if line.startswith("DONE"):
+                            self._parse_done(line)
+                            break
+                        if not self.can_stop:
+                            heard = time.monotonic()
 
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
@@ -4248,18 +4263,19 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, *, owned_fifo=False, on_stopped=None) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force,
+                                 owned_fifo=owned_fifo, on_stopped=on_stopped)
         finally:
             if ka is not None:
                 ka.release()
 
-    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, *, owned_fifo=False, on_stopped=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
@@ -4343,7 +4359,7 @@ class Service:
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
-            if not getattr(self.engine, "batch", 0):
+            if not getattr(self.engine, "batch", 0) and not owned_fifo:
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
@@ -4369,6 +4385,10 @@ class Service:
                     return
             with turn:
                 try:
+                    if getattr(self, 'execution_quarantined', False):
+                        raise EngineDied("protected execution uncertain; operator recovery required")
+                    if cancel.is_set():
+                        raise EngineDied("request cancelled before native dispatch")
                     with self.status_lock:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
@@ -4506,7 +4526,10 @@ class Service:
                             raise
                         finally:
                             try:
-                                gen.close()             # STOP+drain to THIS request's DONE while still holding the
+                                gen.close()
+                                if on_stopped is not None:
+                                    on_stopped(self.engine)
+                                # STOP+drain to THIS request's DONE while still holding the
                                 #                         fifo, so a stop-token break can't leave the shared engine
                                 #                         queue mid-drain for the next request to read as its own DONE
                             except EngineSilent as e:   # #481: the STOP was never acknowledged: the engine is ended
@@ -5351,7 +5374,19 @@ class BadBody(Exception):
         self.status = status
 
 
-def make_handler(svc: Service):
+def make_handler(svc: Service, private_execution_config="/etc/harmony/strata-extraction.json"):
+    try:
+        from serve.private_extraction import load_runtime
+    except ModuleNotFoundError:
+        from private_extraction import load_runtime
+    def render_extraction(body, cancel, barrier):
+        messages, tools, kw = openai_to_messages(body)
+        ids, thinking, max_new = svc.prepare(messages, tools, kw, 1024)
+        run = svc.run(ids, thinking, tools, max_new, body, cancel,
+                      owned_fifo=True, on_stopped=barrier)
+        return openai_collect(openai_chunks(svc, body, ids, thinking, tools, max_new, cancel, run=run))
+    if not hasattr(svc, 'private_extraction'):
+        svc.private_extraction = load_runtime(svc, render_extraction, private_execution_config)
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
@@ -5780,6 +5815,17 @@ def make_handler(svc: Service):
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _post(self):
+            private_path = self.path.split("?")[0].rstrip("/")
+            if private_path == '/harmony/extraction':
+                if svc.private_extraction is None:
+                    nonce = self.headers.get('x-harmony-execution-id', '')
+                    identity = 'chatcmpl-' + nonce if re.fullmatch('[0-9a-f]{32}', nonce) else ''
+                    self._json(503, {'request_id': identity, 'cause': 'profile_unavailable',
+                        'detail': 'protected extraction is not configured', 'execution_started': False,
+                        'cessation_confirmed': False})
+                else:
+                    svc.private_extraction.handle(self)
+                return
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
@@ -6733,10 +6779,10 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
     return bool(name) and (name in LOOPBACK_NAMES or name.endswith(".localhost") or _name_in(name, names))
 
 
-def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+def serve(svc: Service, host="127.0.0.1", port=8095, *, private_execution_config="/etc/harmony/strata-extraction.json") -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     svc.start_telemetry()
-    httpd = Server((host, port), make_handler(svc))
+    httpd = Server((host, port), make_handler(svc, private_execution_config))
     httpd.svc = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
