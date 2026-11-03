@@ -10543,7 +10543,7 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        std::printf("READY %lld stop gpu_barrier\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -11351,6 +11351,19 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") break;
+            // The server holds its generation FIFO while correlating this
+            // barrier. A DONE line alone is not a device-wide stop receipt.
+            if (line.rfind("BARRIER ", 0) == 0) {
+                const std::string nonce = line.substr(8);
+                if (nonce.size() != 32 || nonce.find_first_not_of("0123456789abcdef") != std::string::npos) {
+                    std::printf("ERR invalid barrier identity\n");
+                } else {
+                    const bool stopped = cudaDeviceSynchronize() == cudaSuccess;
+                    std::printf("BARRIER %s %s\n", nonce.c_str(), stopped ? "ok" : "failed");
+                }
+                std::fflush(stdout);
+                continue;
+            }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() {
