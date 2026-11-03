@@ -54,6 +54,7 @@ def load_runtime(svc, render, path='/etc/harmony/strata-extraction.json'):
 class PrivateExtraction:
     def __init__(self, svc, token, render):
         self.svc, self.token, self.render = svc, token, render
+        svc.engine._harmony_extraction_context = threading.local()
         self.ingress = threading.Lock()
         self.active = None
         self.quarantined = False
@@ -123,11 +124,13 @@ class PrivateExtraction:
                 confirm_gpu_idle(engine.proc,engine.lines,nonce,supported=engine.can_confirm_gpu_idle)
                 result['confirmed']=True
             def worker():
+                self.svc.engine._harmony_extraction_context.active = True
                 try:
                     result['value']=self.render(body,cancel,barrier)
                 except BaseException:
                     result['failed']=True
                 finally:
+                    self.svc.engine._harmony_extraction_context.active = False
                     if not result.get('confirmed'):
                         self.quarantined=True
                         self.svc.execution_quarantined=True

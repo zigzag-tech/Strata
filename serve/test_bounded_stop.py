@@ -130,3 +130,21 @@ def test_service_barrier_runs_before_generation_fifo_is_released():
     assert observed==['barrier']
     assert events[-1][0]=='done'
     assert not svc.fifo.locked()
+
+
+def test_ordinary_chat_keeps_its_existing_stop_allowance(tmp_path):
+    from serve.server import StrataEngine
+    exe=tmp_path/'slow-stop-engine'
+    exe.write_text('#!'+sys.executable+"\nimport sys,time\nprint('READY 4096 stop',flush=True)\nfor line in sys.stdin:\n if line.startswith('GEN '): print('T 7',flush=True)\n elif line.strip()=='STOP':\n  time.sleep(2.2)\n  print('DONE 1 1 0 0 cancel 0 0 0',flush=True)\n elif line.strip()=='QUIT': break\n")
+    exe.chmod(0o700)
+    engine=StrataEngine(str(exe),[])
+    engine.silence_s=5
+    proc=engine.proc
+    try:
+        gen=engine.generate([1],10,{},threading.Event())
+        assert next(gen)==7
+        gen.close()
+        assert proc.poll() is None
+        assert engine.last['finish']=='cancel'
+    finally:
+        engine.close();proc.wait(timeout=2)

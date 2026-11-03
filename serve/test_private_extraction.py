@@ -129,3 +129,14 @@ def test_hung_native_execution_retains_uncertainty_after_bounded_failure(endpoin
     assert time.monotonic()-began < 7
     assert svc.private_extraction.quarantined
     assert call(base)[0]==429
+
+
+def test_parallel_engine_cannot_claim_an_exclusive_device_barrier(endpoint):
+    base,svc=endpoint()
+    svc.engine.batch=2
+    try:
+        status,body=call(base)
+        assert status==503 and body['execution_started'] is False
+        assert svc.private_extraction.active is None
+    finally:
+        svc.engine.batch=0

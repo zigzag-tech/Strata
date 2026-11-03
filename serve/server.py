@@ -2087,16 +2087,48 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
         finally:
             if not done:
-                try:
-                    from serve.bounded_stop import stop_and_drain, StopUnconfirmed
-                except ModuleNotFoundError:
-                    from bounded_stop import stop_and_drain, StopUnconfirmed
-                try:
-                    line = stop_and_drain(self.proc, self.lines, can_stop=self.can_stop,
-                        initial_lines=(carry,) if carry is not NO_LINE else ())
-                except StopUnconfirmed as exc:
-                    raise EngineDied(str(exc)) from exc
-                self._parse_done(line)
+                protected = getattr(getattr(self, '_harmony_extraction_context', None), 'active', False)
+                if protected:
+                    try:
+                        from serve.bounded_stop import stop_and_drain, StopUnconfirmed
+                    except ModuleNotFoundError:
+                        from bounded_stop import stop_and_drain, StopUnconfirmed
+                    try:
+                        line = stop_and_drain(self.proc, self.lines, can_stop=self.can_stop,
+                            initial_lines=(carry,) if carry is not NO_LINE else ())
+                    except StopUnconfirmed as exc:
+                        raise EngineDied(str(exc)) from exc
+                    self._parse_done(line)
+                else:
+                    if self.can_stop:
+                        try:
+                            self.proc.stdin.write("STOP\n")
+                            self.proc.stdin.flush()
+                        except OSError:
+                            pass
+                    # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
+                    # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
+                    # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
+                    heard = time.monotonic()
+                    while True:
+                        left = allow - (time.monotonic() - heard) if allow > 0 else None
+                        try:
+                            if carry is not NO_LINE:          # read already, after the last token
+                                line, carry = carry, NO_LINE
+                            elif left is not None and left <= 0:
+                                raise queue.Empty
+                            else:
+                                line = self.lines.get(timeout=left)
+                        except queue.Empty:
+                            raise self._silent("the engine did not finish the request after it was stopped (STOP) "
+                                               f"within {allow:.0f} s") from None
+                        if line is None or line.startswith("ERR"):
+                            break
+                        if line.startswith("DONE"):
+                            self._parse_done(line)
+                            break
+                        if not self.can_stop:
+                            heard = time.monotonic()
 
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
