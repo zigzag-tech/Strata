@@ -1085,6 +1085,24 @@ class StrataEngine:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
+    # `lp_lines`: the LP lines of the tokens of the request being read (logprobs), taken by LogprobEntries on the
+    # thread that reads the request's tokens.  With batch slots several requests run at once: one deque per thread.
+    @property
+    def lp_lines(self):
+        if self.batch:
+            tl = self.__dict__.setdefault("_tl", threading.local())
+            if not hasattr(tl, "lp_lines"):
+                tl.lp_lines = collections.deque()
+            return tl.lp_lines
+        return self.__dict__.setdefault("_lp_lines", collections.deque())
+
+    @lp_lines.setter
+    def lp_lines(self, value):
+        if self.batch:
+            self.__dict__.setdefault("_tl", threading.local()).lp_lines = value
+        else:
+            self.__dict__["_lp_lines"] = value
+
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
                  retry_args: list[str] | None = None):
@@ -1573,6 +1591,12 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        k = top_logprobs(sampling)
+        if k is not None:                       # an LP line after each T line (an engine without them ignores the key)
+            keys += f" logprobs={k}"
+        hp = sampling.get("strata_hidden_path")
+        if isinstance(hp, str) and os.path.dirname(hp) == HIDDEN_DIR:   # only a path hidden_request made
+            keys += f" hidden={hp}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -4331,6 +4355,7 @@ class Detokenizer:
 
 
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
+NO_LINE = object()                                   # StrataEngine.generate: no line held after a token
 
 
 def top_logprobs(req: dict):
@@ -5532,7 +5557,7 @@ class Service:
             self.prompts.forget(ids)
 
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None, prefill=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
@@ -5560,6 +5585,8 @@ class Service:
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
+        if prefill:                                   # continue_final_message: the open assistant turn's text
+            ids = ids + self.tok.encode(prefill)
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
@@ -6781,6 +6808,51 @@ def prompt_progress(svc: Service):
         return None
     return {"total": int(total), "cache": int(getattr(engine, "reused", 0) or 0), "processed": int(read),
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
+
+
+HIDDEN_DIR = tempfile.mkdtemp(prefix="strata-hidden-")
+
+
+def hidden_request(req: dict):
+    """`"strata_hidden": true`: the reply carries the first token's head input (the vector the head multiplies,
+    n_embd float32) as choices[0].strata_hidden, for a decision probe trained on it. One token, not streamed: else a
+    400. The engine writes it to a file this server names; a path in the request itself is dropped."""
+    req.pop("strata_hidden_path", None)
+    if not req.get("strata_hidden"):
+        return None
+    if int(req.get("max_completion_tokens") or req.get("max_tokens") or 0) != 1 or req.get("stream"):
+        raise ValueError("strata_hidden: only with max_tokens 1 and stream false")
+    req["strata_hidden_path"] = os.path.join(HIDDEN_DIR, uuid.uuid4().hex + ".f32")
+    return req["strata_hidden_path"]
+
+
+def take_hidden(path: str):
+    """The engine's file as the response field, removed once read; None when the engine wrote none."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        os.unlink(path)
+    except OSError:
+        return None
+    if not raw or len(raw) % 4:
+        return None
+    return {"dtype": "float32", "dim": len(raw) // 4, "b64": base64.b64encode(raw).decode()}
+
+
+def continued_message(req: dict, messages: list, kwargs: dict):
+    """vLLM's `continue_final_message`: the reply continues the last message, an assistant turn left open, instead of
+    starting a new one (a typed decision primes its answer with `{"answer": "`).  That message leaves `messages`; its
+    text is returned for prepare() to put after the generation prompt.  Thinking off only: with thinking on the
+    generation prompt opens a reasoning block and the text would land inside it."""
+    if not req.get("continue_final_message"):
+        return None
+    last = messages[-1] if messages else None
+    if not last or last.get("role") != "assistant" or not isinstance(last.get("content"), str) or last.get("tool_calls"):
+        raise ValueError("continue_final_message: the last message must be an assistant message with text content")
+    if kwargs.get("enable_thinking", True) is not False:
+        raise ValueError("continue_final_message: only with thinking off (chat_template_kwargs.enable_thinking false)")
+    messages.pop()
+    return last["content"]
 
 
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
@@ -8249,6 +8321,8 @@ def make_handler(svc: Service, private_execution_config="/etc/harmony/strata-ext
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)                # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
+            prefill = continued_message(req, messages, kw)            # a 400 before anything is sent
+            hidden = hidden_request(req)                              # ... and so is strata_hidden past one token
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
@@ -8278,6 +8352,11 @@ def make_handler(svc: Service, private_execution_config="/etc/harmony/strata-ext
                     raise ValueError(f"allowed_token_ids: {bad[0]} is outside the vocabulary "
                                      f"(0..{n_vocab - 1})")
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
+            if top_logprobs(req) is not None and getattr(svc.engine, "batch", 0) and max_req != 1:
+                # a batch slot's BT lines carry no LP lines: past its first token a request would get partial or
+                # misplaced entries.  One token (a typed decision) is read on the control lines and has its LP line.
+                raise ValueError('logprobs: with "parallel" (batch slots) only for max_tokens 1; '
+                                 'run without "parallel" for longer replies')
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:
@@ -8294,7 +8373,8 @@ def make_handler(svc: Service, private_execution_config="/etc/harmony/strata-ext
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel,
+                                                 prefill=prefill)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
@@ -8303,7 +8383,14 @@ def make_handler(svc: Service, private_execution_config="/etc/harmony/strata-ext
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                out = openai_collect(chunks)
+                if hidden is not None:
+                    got = take_hidden(hidden)
+                    if got is None:                          # an engine without the key, or a failed write
+                        return self._json(500, {"error": {"type": "server_error",
+                                                          "message": "strata_hidden: the engine wrote no hidden state"}})
+                    out["choices"][0]["strata_hidden"] = got
+                return self._json(200, out)
             self._sse()
             try:
                 for c in chunks:

@@ -15114,6 +15114,17 @@ int main(int argc, char** argv) {
             int req_logprobs = -1;
             // allowed=a,b,c: with logprobs, print only these token ids (renormalized server-side).
             std::vector<int32_t> req_allowed;
+            std::string req_hidden;
+            auto emit_hidden = [&req_hidden](const strata::core::Verifier& v, int row, int32_t tok) {
+                if (!req_hidden.empty()) {
+                    std::vector<float> h((size_t) std::max<int64_t>(v.embd(), 0));
+                    std::FILE* f = !h.empty() && v.copy_hidden(row, h.data()) ? std::fopen(req_hidden.c_str(), "wb") : nullptr;
+                    const bool ok = f != nullptr && std::fwrite(h.data(), sizeof(float), h.size(), f) == h.size();
+                    if (f) std::fclose(f);
+                    if (!ok) std::fprintf(stderr, "strata serve: hidden: cannot write %s\n", req_hidden.c_str());
+                    req_hidden.clear();
+                }
+            };
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
@@ -15179,6 +15190,8 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "logprobs") req_logprobs = std::clamp(std::atoi(tok.c_str() + eq + 1), -1, 20);
+                    else if (key == "hidden") req_hidden = tok.substr(eq + 1);
                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
                     else if (key == "spec_min_p") { req_spec_min_p = std::clamp((double) fv, 0.0, 1.0); req_min_p_set = true; }
                     else if (key == "draft") req_draft = tok.substr(eq + 1);
@@ -17995,6 +18008,7 @@ int main(int argc, char** argv) {
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
                         if (req_logprobs >= 0) emit_lp_line(V1(A), i, outp[(size_t) i], req_logprobs, req_allowed);
+                        emit_hidden(V1(A), i, outp[(size_t) i]);
                         strata::core::progress_beat();
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
@@ -18571,6 +18585,7 @@ int main(int argc, char** argv) {
                 for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     if (req_logprobs >= 0) emit_lp_line(ver, i, outv[(size_t) i], req_logprobs, req_allowed);
+                    emit_hidden(ver, i, outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);
